@@ -1,17 +1,17 @@
 /**
  * useWhisper – React hook for browser-based speech-to-text.
  *
- * Architecture:
- * - Microphone → GainNode (3×) → AnalyserNode → ScriptProcessor → buffer
- * - Voice Activity Detection (VAD) segments audio into utterances
- * - Each utterance is sent to Whisper the moment the speaker pauses
- * - A rolling partial preview re-transcribes the current buffer every 800 ms
- *   so text appears on screen while the user is still speaking
+ * Architecture  (sliding-window with cross-packet correction):
+ *   Microphone → GainNode → AnalyserNode → ScriptProcessor → growing buffer
+ *
+ *   A tight async loop continuously re-transcribes the *entire* current
+ *   window.  Because Whisper sees more context each pass, earlier words
+ *   get corrected automatically – just like the Web Speech API's interim
+ *   results.  When the window grows past MAX_WINDOW_S the current text is
+ *   committed as final and the buffer resets.
  */
 import { useState, useRef, useCallback } from 'react';
 import { loadWhisperModel, transcribeAudio } from '../services/whisperService';
-
-// ── Types ──────────────────────────────────────────────────────────────────────
 
 export type DemoState = 'idle' | 'loading' | 'ready' | 'recording' | 'processing';
 
@@ -22,32 +22,17 @@ export interface LoadProgress {
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-/** Microphone gain multiplier – boosts quiet mics significantly */
-const MIC_GAIN = 3.0;
-
-/** RMS level below which audio is treated as silence (post-gain) */
-const SILENCE_THRESHOLD = 0.012;
-
-/** ms of silence that marks the end of an utterance → triggers transcription */
-const UTTERANCE_GAP_MS = 700;
-
-/** ms of continuous silence before auto-stopping the entire recording */
-const AUTO_STOP_SILENCE_MS = 6_000;
-
-/** Minimum audio duration (s) worth sending to Whisper */
-const MIN_UTTERANCE_S = 0.4;
-
-/** How often (ms) to produce a partial/preview transcript of in-progress audio */
-const PARTIAL_INTERVAL_MS = 800;
-
-/** Minimum audio (s) before we bother with a partial preview */
-const MIN_PARTIAL_S = 0.6;
+const MIC_GAIN = 2.5;
+const MIN_AUDIO_S = 0.5;          // don't bother transcribing less than this
+const MAX_WINDOW_S = 10;          // commit & reset when buffer exceeds this
+const SILENCE_THRESHOLD = 0.008;
+const AUTO_STOP_SILENCE_MS = 30_000;
 
 // ── Utility ────────────────────────────────────────────────────────────────────
 
-function resampleAudio(data: Float32Array, fromRate: number, toRate: number): Float32Array {
-  if (fromRate === toRate) return data;
-  const ratio = fromRate / toRate;
+function resampleTo16k(data: Float32Array, fromRate: number): Float32Array {
+  if (fromRate === 16_000) return data;
+  const ratio = fromRate / 16_000;
   const len = Math.round(data.length / ratio);
   const out = new Float32Array(len);
   for (let i = 0; i < len; i++) {
@@ -60,19 +45,16 @@ function resampleAudio(data: Float32Array, fromRate: number, toRate: number): Fl
   return out;
 }
 
-/** Normalise audio to use full dynamic range (peak → 0.95) */
-function normaliseAudio(data: Float32Array): Float32Array {
+function normalise(data: Float32Array): Float32Array {
   let peak = 0;
   for (let i = 0; i < data.length; i++) {
     const abs = Math.abs(data[i]);
     if (abs > peak) peak = abs;
   }
-  if (peak < 0.01) return data; // virtually silent – don't amplify noise
+  if (peak < 0.01) return data;
   const scale = 0.95 / peak;
   const out = new Float32Array(data.length);
-  for (let i = 0; i < data.length; i++) {
-    out[i] = data[i] * scale;
-  }
+  for (let i = 0; i < data.length; i++) out[i] = data[i] * scale;
   return out;
 }
 
@@ -87,17 +69,20 @@ function combineChunks(chunks: Float32Array[]): Float32Array {
   return combined;
 }
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 // ── Hook ───────────────────────────────────────────────────────────────────────
 
 export function useWhisper() {
   const [state, setState] = useState<DemoState>('idle');
   const [transcript, setTranscript] = useState('');
-  const [partialText, setPartialText] = useState('');
+  const [liveText, setLiveText] = useState('');
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [volumeLevel, setVolumeLevel] = useState(0);
   const [loadProgress, setLoadProgress] = useState<LoadProgress>({ progress: 0, file: '' });
   const [error, setError] = useState<string | null>(null);
 
+  // Audio graph refs
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -105,100 +90,116 @@ export function useWhisper() {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
 
-  /** Audio chunks for the current utterance (speech segment) */
-  const utteranceChunksRef = useRef<Float32Array[]>([]);
+  // Buffer & loop state
+  const audioBufferRef = useRef<Float32Array[]>([]);
   const isRecordingRef = useRef(false);
+  const loopRunningRef = useRef(false);
+  const liveTextRef = useRef('');
   const lastSoundRef = useRef(Date.now());
-  const isSpeakingRef = useRef(false);
-  const transcribeQueueRef = useRef<Float32Array[]>([]);
-  const processingRef = useRef(false);
-  const partialTimerRef = useRef(0);
 
-  const stopRef = useRef<(() => Promise<void>) | undefined>(undefined);
+  // ── Commit liveText → transcript and reset the buffer ────────────────────
 
-  // ── Queue processor: drains committed utterances one by one ──────────────
+  const commitLiveText = useCallback(() => {
+    const text = liveTextRef.current.trim();
+    if (text) {
+      setTranscript((prev) => (prev ? `${prev} ${text}` : text));
+    }
+    liveTextRef.current = '';
+    setLiveText('');
+    audioBufferRef.current = [];
+  }, []);
 
-  const processQueue = useCallback(async () => {
-    if (processingRef.current) return;
-    processingRef.current = true;
+  // ── Continuous transcription loop ────────────────────────────────────────
+  //
+  // Runs as a tight async loop while recording.  Each pass:
+  //   1. Combine entire pending buffer
+  //   2. If buffer is short → wait a bit and retry
+  //   3. If buffer exceeds MAX_WINDOW_S → commit & reset
+  //   4. Otherwise → transcribe the whole window, update liveText
+  //
+  // Because the window *grows* between passes, Whisper sees progressively
+  // more context and self-corrects earlier words (cross-packet correction).
 
-    while (transcribeQueueRef.current.length > 0) {
-      const audio = transcribeQueueRef.current.shift()!;
-      const sampleRate = audioCtxRef.current?.sampleRate ?? 16_000;
-      const resampled = resampleAudio(audio, sampleRate, 16_000);
-      const normalised = normaliseAudio(resampled);
+  const runTranscriptionLoop = useCallback(async () => {
+    if (loopRunningRef.current) return;
+    loopRunningRef.current = true;
+
+    while (isRecordingRef.current) {
+      const chunks = audioBufferRef.current;
+      if (chunks.length === 0) {
+        await sleep(100);
+        continue;
+      }
+
+      const combined = combineChunks(chunks);
+      const sampleRate = audioCtxRef.current?.sampleRate ?? 44_100;
+      const duration = combined.length / sampleRate;
+
+      // Not enough audio yet – wait a bit
+      if (duration < MIN_AUDIO_S) {
+        await sleep(100);
+        continue;
+      }
+
+      // Window too large → commit current text and start fresh
+      if (duration > MAX_WINDOW_S) {
+        commitLiveText();
+        continue;
+      }
+
+      // ── Transcribe the entire current window ──
+      const resampled = resampleTo16k(combined, sampleRate);
+      const normalised = normalise(resampled);
 
       setIsTranscribing(true);
       try {
         const text = await transcribeAudio(normalised);
-        if (text) {
-          setTranscript((prev) => (prev ? `${prev} ${text}` : text));
-          setPartialText(''); // clear partial once committed
+        if (text && isRecordingRef.current) {
+          liveTextRef.current = text;
+          setLiveText(text);
         }
       } catch (err) {
         console.error('Transcription error:', err);
-      } finally {
+      }
+      setIsTranscribing(false);
+
+      // Small breather so we don't starve the main thread
+      await sleep(50);
+    }
+
+    // ── Recording stopped – handle remaining audio ──────────────────────────
+
+    const remaining = audioBufferRef.current;
+    if (remaining.length > 0) {
+      const audio = combineChunks(remaining);
+      const sr = audioCtxRef.current?.sampleRate ?? 44_100;
+      if (audio.length / sr >= MIN_AUDIO_S) {
+        setIsTranscribing(true);
+        try {
+          const text = await transcribeAudio(
+            normalise(resampleTo16k(audio, sr)),
+          );
+          if (text) {
+            setTranscript((prev) => (prev ? `${prev} ${text}` : text));
+          }
+        } catch (err) {
+          console.error('Final transcription error:', err);
+        }
         setIsTranscribing(false);
       }
+      audioBufferRef.current = [];
+    } else if (liveTextRef.current) {
+      commitLiveText();
     }
 
-    processingRef.current = false;
-  }, []);
+    liveTextRef.current = '';
+    setLiveText('');
+    loopRunningRef.current = false;
+  }, [commitLiveText]);
 
-  // ── Commit current utterance to the queue ────────────────────────────────
+  // ── Cleanup audio graph ──────────────────────────────────────────────────
 
-  const commitUtterance = useCallback(() => {
-    const chunks = utteranceChunksRef.current;
-    if (chunks.length === 0) return;
-
-    const combined = combineChunks(chunks);
-    utteranceChunksRef.current = [];
-
-    const sampleRate = audioCtxRef.current?.sampleRate ?? 16_000;
-    if (combined.length / sampleRate < MIN_UTTERANCE_S) return;
-
-    transcribeQueueRef.current.push(combined);
-    processQueue();
-  }, [processQueue]);
-
-  // ── Partial preview: transcribe in-progress audio for live feel ──────────
-
-  const runPartialPreview = useCallback(async () => {
-    const chunks = utteranceChunksRef.current;
-    if (chunks.length === 0) return;
-
-    const combined = combineChunks(chunks);
-    const sampleRate = audioCtxRef.current?.sampleRate ?? 16_000;
-    if (combined.length / sampleRate < MIN_PARTIAL_S) return;
-
-    // Don't block committed transcription
-    if (processingRef.current) return;
-
-    const resampled = resampleAudio(combined, sampleRate, 16_000);
-    const normalised = normaliseAudio(resampled);
-
-    try {
-      const text = await transcribeAudio(normalised);
-      // Only update partial if we're still recording (user hasn't stopped)
-      if (isRecordingRef.current && text) {
-        setPartialText(text);
-      }
-    } catch {
-      // Ignore partial errors
-    }
-  }, []);
-
-  // ── Tear down ────────────────────────────────────────────────────────────
-
-  const stopRecordingInternal = useCallback(async () => {
-    if (!isRecordingRef.current) return;
-    isRecordingRef.current = false;
-
-    if (partialTimerRef.current) {
-      clearInterval(partialTimerRef.current);
-      partialTimerRef.current = 0;
-    }
-
+  const cleanupAudio = useCallback(() => {
     processorRef.current?.disconnect();
     processorRef.current = null;
     gainNodeRef.current?.disconnect();
@@ -207,14 +208,20 @@ export function useWhisper() {
     sourceRef.current = null;
     mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
     mediaStreamRef.current = null;
+  }, []);
 
-    // Commit any remaining utterance
-    commitUtterance();
+  // ── Stop recording ──────────────────────────────────────────────────────
 
-    // Wait for queue to finish
+  const stopRecording = useCallback(async () => {
+    if (!isRecordingRef.current) return;
+    isRecordingRef.current = false;
+
+    cleanupAudio();
     setState('processing');
-    while (processingRef.current || transcribeQueueRef.current.length > 0) {
-      await new Promise((r) => setTimeout(r, 80));
+
+    // Wait for the transcription loop to finish its final pass
+    while (loopRunningRef.current) {
+      await sleep(50);
     }
 
     if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
@@ -222,12 +229,12 @@ export function useWhisper() {
     }
     audioCtxRef.current = null;
     analyserRef.current = null;
-    setPartialText('');
     setVolumeLevel(0);
     setState('ready');
-  }, [commitUtterance]);
+  }, [cleanupAudio]);
 
-  stopRef.current = stopRecordingInternal;
+  const stopRef = useRef(stopRecording);
+  stopRef.current = stopRecording;
 
   // ── Initialise model ─────────────────────────────────────────────────────
 
@@ -258,27 +265,26 @@ export function useWhisper() {
   const startRecording = useCallback(async () => {
     try {
       setError(null);
-      setPartialText('');
+      setLiveText('');
+      liveTextRef.current = '';
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          sampleRate: 16_000,
           echoCancellation: true,
-          noiseSuppression: false,   // keep it OFF – lets more signal through
-          autoGainControl: true,     // browser-level AGC helps a lot
+          noiseSuppression: true,
+          autoGainControl: true,
         },
       });
-
       mediaStreamRef.current = stream;
 
-      const ctx = new AudioContext({ sampleRate: 16_000 });
+      // Use the browser's native sample rate – we resample to 16 kHz ourselves
+      const ctx = new AudioContext();
       audioCtxRef.current = ctx;
 
       const source = ctx.createMediaStreamSource(stream);
       sourceRef.current = source;
 
-      // ── Gain boost ──
       const gainNode = ctx.createGain();
       gainNode.gain.value = MIC_GAIN;
       gainNodeRef.current = gainNode;
@@ -287,83 +293,60 @@ export function useWhisper() {
       analyser.fftSize = 2048;
       analyserRef.current = analyser;
 
-      const processor = ctx.createScriptProcessor(2048, 1, 1);
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
 
       const silentGain = ctx.createGain();
       silentGain.gain.value = 0;
 
-      // Graph: source → gain → analyser → processor → silent → destination
+      // source → gain → analyser → processor → silent → destination
       source.connect(gainNode);
       gainNode.connect(analyser);
       analyser.connect(processor);
       processor.connect(silentGain);
       silentGain.connect(ctx.destination);
 
-      utteranceChunksRef.current = [];
-      transcribeQueueRef.current = [];
+      audioBufferRef.current = [];
       isRecordingRef.current = true;
-      isSpeakingRef.current = false;
       lastSoundRef.current = Date.now();
 
       processor.onaudioprocess = (e: AudioProcessingEvent) => {
         if (!isRecordingRef.current) return;
 
-        const channelData = e.inputBuffer.getChannelData(0);
-        utteranceChunksRef.current.push(new Float32Array(channelData));
+        const data = e.inputBuffer.getChannelData(0);
+        audioBufferRef.current.push(new Float32Array(data));
 
-        // ── RMS for silence detection + UI volume meter ──
+        // Volume meter + silence detection
         let sum = 0;
-        for (let i = 0; i < channelData.length; i++) {
-          sum += channelData[i] * channelData[i];
-        }
-        const rms = Math.sqrt(sum / channelData.length);
-        setVolumeLevel(Math.min(rms * 5, 1)); // normalise to 0-1 for UI
+        for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+        const rms = Math.sqrt(sum / data.length);
+        setVolumeLevel(Math.min(rms * 5, 1));
 
-        const now = Date.now();
-
-        if (rms > SILENCE_THRESHOLD) {
-          // Sound detected
-          lastSoundRef.current = now;
-          isSpeakingRef.current = true;
-        } else if (isSpeakingRef.current && now - lastSoundRef.current > UTTERANCE_GAP_MS) {
-          // Speaker paused → commit utterance immediately
-          isSpeakingRef.current = false;
-          commitUtterance();
-        }
-
-        // Auto-stop after long silence
-        if (now - lastSoundRef.current > AUTO_STOP_SILENCE_MS) {
-          stopRef.current?.();
+        if (rms > SILENCE_THRESHOLD) lastSoundRef.current = Date.now();
+        if (Date.now() - lastSoundRef.current > AUTO_STOP_SILENCE_MS) {
+          stopRef.current();
         }
       };
 
       setState('recording');
 
-      // Partial preview timer
-      partialTimerRef.current = window.setInterval(() => {
-        if (isRecordingRef.current && utteranceChunksRef.current.length > 0) {
-          runPartialPreview();
-        }
-      }, PARTIAL_INTERVAL_MS);
+      // Fire-and-forget: start the continuous transcription loop
+      runTranscriptionLoop();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to access microphone');
     }
-  }, [commitUtterance, runPartialPreview]);
-
-  const stopRecording = useCallback(async () => {
-    await stopRecordingInternal();
-  }, [stopRecordingInternal]);
+  }, [runTranscriptionLoop]);
 
   const clearTranscript = useCallback(() => {
     setTranscript('');
-    setPartialText('');
+    setLiveText('');
+    liveTextRef.current = '';
   }, []);
 
   return {
     state,
     transcript,
-    partialText,
+    liveText,
     isTranscribing,
     volumeLevel,
     loadProgress,

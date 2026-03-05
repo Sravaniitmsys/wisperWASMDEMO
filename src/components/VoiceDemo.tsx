@@ -7,7 +7,7 @@ export default function VoiceDemo() {
   const {
     state,
     transcript,
-    partialText,
+    liveText,
     isTranscribing,
     volumeLevel,
     loadProgress,
@@ -49,7 +49,7 @@ export default function VoiceDemo() {
             🎙️ Start Voice Demo
           </button>
           <p className="hint">
-            Click to load the Whisper AI model into your browser
+            Click to load the Whisper AI model (~77 MB, cached after first load)
           </p>
         </div>
       )}
@@ -67,13 +67,13 @@ export default function VoiceDemo() {
       {/* ── Ready state ─────────────────────────────────────────────────── */}
       {state === 'ready' && (
         <div className="demo-section fade-in">
-          <div className="status-badge ready">✓ Voice AI Ready</div>
+          <div className="status-badge ready">✓ Whisper Base Ready</div>
           <button onClick={startRecording} className="btn btn-record btn-large">
             🎤 Start Recording
           </button>
           <TranscriptBox
             transcript={transcript}
-            partialText=""
+            liveText=""
             onClear={clearTranscript}
             isTranscribing={false}
           />
@@ -112,11 +112,11 @@ export default function VoiceDemo() {
             ⏹ Stop Recording
           </button>
           <p className="hint">
-            Speak clearly — text appears as you pause · auto-stops after 6 s of silence
+            Speak naturally — text refines as more context arrives
           </p>
           <TranscriptBox
             transcript={transcript}
-            partialText={partialText}
+            liveText={liveText}
             onClear={clearTranscript}
             isTranscribing={isTranscribing}
           />
@@ -132,7 +132,7 @@ export default function VoiceDemo() {
           <div className="processing-spinner" />
           <TranscriptBox
             transcript={transcript}
-            partialText=""
+            liveText=""
             onClear={clearTranscript}
             isTranscribing
           />

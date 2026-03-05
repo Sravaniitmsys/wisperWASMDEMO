@@ -399,14 +399,19 @@
   font-style: italic;
 }
 
-/* ── Partial (preview) text ───────────────────────────────────────────────── */
-.partial-text {
+/* ── Final (committed) text ────────────────────────────────────────────────── */
+.final-text {
+  color: var(--text-primary);
+}
+
+/* ── Live (refining) text ─────────────────────────────────────────────────── */
+.live-text {
   color: var(--accent);
-  opacity: 0.7;
-  font-style: italic;
-  border-left: 2px solid rgba(0, 212, 255, 0.3);
+  opacity: 0.85;
+  border-left: 2px solid rgba(0, 212, 255, 0.4);
   padding-left: 0.5em;
   margin-left: 0.25em;
+  transition: opacity 0.15s ease;
 }
 
 /* ── Processing spinner ───────────────────────────────────────────────────── */

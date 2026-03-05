@@ -1,18 +1,21 @@
 interface TranscriptBoxProps {
   transcript: string;
-  partialText: string;
+  liveText: string;
   onClear: () => void;
   isTranscribing?: boolean;
 }
 
 export default function TranscriptBox({
   transcript,
-  partialText,
+  liveText,
   onClear,
   isTranscribing = false,
 }: TranscriptBoxProps) {
+  const fullText = transcript + (liveText ? '' : '');
+
   const handleDownload = () => {
-    const blob = new Blob([transcript], { type: 'text/plain' });
+    const downloadText = transcript + (liveText ? ' ' + liveText : '');
+    const blob = new Blob([downloadText], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -21,14 +24,14 @@ export default function TranscriptBox({
     URL.revokeObjectURL(url);
   };
 
-  const hasContent = transcript || partialText;
+  const hasContent = transcript || liveText;
 
   return (
     <div className="transcript-box">
       <div className="transcript-header">
         <h3>Live Transcript</h3>
         <div className="transcript-actions">
-          {transcript && (
+          {fullText && (
             <>
               <button onClick={handleDownload} className="btn btn-small btn-secondary">
                 Download
@@ -44,10 +47,8 @@ export default function TranscriptBox({
       <div className="transcript-content">
         {hasContent ? (
           <p>
-            {transcript && <span>{transcript} </span>}
-            {partialText && (
-              <span className="partial-text">{partialText}</span>
-            )}
+            {transcript && <span className="final-text">{transcript} </span>}
+            {liveText && <span className="live-text">{liveText}</span>}
             {isTranscribing && (
               <span className="typing-indicator">
                 <span />
