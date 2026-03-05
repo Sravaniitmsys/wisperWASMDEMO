@@ -1,14 +1,17 @@
 /**
- * useWhisper – React hook for browser-based speech-to-text.
+ * useWhisper – Hybrid speech-to-text: Web Speech API + Whisper WASM
  *
- * Architecture  (sliding-window with cross-packet correction):
- *   Microphone → GainNode → AnalyserNode → ScriptProcessor → growing buffer
+ * Architecture (dual-engine for instant + accurate transcription):
  *
- *   A tight async loop continuously re-transcribes the *entire* current
- *   window.  Because Whisper sees more context each pass, earlier words
- *   get corrected automatically – just like the Web Speech API's interim
- *   results.  When the window grows past MAX_WINDOW_S the current text is
- *   committed as final and the buffer resets.
+ *   Microphone stream
+ *     ├─→ Web Speech API  → instant interim text (displayed immediately)
+ *     └─→ AudioContext → GainNode → buffer
+ *           └─→ Whisper WASM (background) → high-accuracy correction
+ *
+ *  - Web Speech API gives character-by-character instant results
+ *  - Whisper WASM runs on buffered audio segments for better accuracy
+ *  - When Whisper finishes a segment it replaces the Web Speech text
+ *  - Result: snap-instant display + offline-capable accuracy
  */
 import { useState, useRef, useCallback } from 'react';
 import { loadWhisperModel, transcribeAudio } from '../services/whisperService';
@@ -20,13 +23,54 @@ export interface LoadProgress {
   file: string;
 }
 
+// ── Types & Globals ────────────────────────────────────────────────────────────
+
+// Web Speech API type shims (not in all TS libs)
+interface SpeechRecognitionResult {
+  readonly isFinal: boolean;
+  readonly length: number;
+  [index: number]: { transcript: string; confidence: number };
+}
+interface SpeechRecognitionResultList {
+  readonly length: number;
+  [index: number]: SpeechRecognitionResult;
+}
+interface SpeechRecognitionEvent extends Event {
+  readonly resultIndex: number;
+  readonly results: SpeechRecognitionResultList;
+}
+interface SpeechRecognitionErrorEvent extends Event {
+  readonly error: string;
+  readonly message?: string;
+}
+interface SpeechRecognitionInstance extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  maxAlternatives: number;
+  onresult: ((ev: SpeechRecognitionEvent) => void) | null;
+  onerror: ((ev: SpeechRecognitionErrorEvent) => void) | null;
+  onend: (() => void) | null;
+  start(): void;
+  stop(): void;
+  abort(): void;
+}
+type SpeechRecognitionCtor = new () => SpeechRecognitionInstance;
+
+declare global {
+  interface Window {
+    webkitSpeechRecognition: SpeechRecognitionCtor;
+    SpeechRecognition: SpeechRecognitionCtor;
+  }
+}
+
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const MIC_GAIN = 2.5;
-const MIN_AUDIO_S = 0.5;          // don't bother transcribing less than this
-const MAX_WINDOW_S = 10;          // commit & reset when buffer exceeds this
 const SILENCE_THRESHOLD = 0.008;
-const AUTO_STOP_SILENCE_MS = 30_000;
+const AUTO_STOP_SILENCE_MS = 60_000;
+const WHISPER_SEGMENT_S = 8;       // buffer this much audio then run Whisper correction
+const MIN_WHISPER_S = 1.0;         // minimum audio to bother sending to Whisper
 
 // ── Utility ────────────────────────────────────────────────────────────────────
 
@@ -71,16 +115,24 @@ function combineChunks(chunks: Float32Array[]): Float32Array {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** Check if Web Speech API is available */
+function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
+  if (typeof window === 'undefined') return null;
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
 // ── Hook ───────────────────────────────────────────────────────────────────────
 
 export function useWhisper() {
   const [state, setState] = useState<DemoState>('idle');
-  const [transcript, setTranscript] = useState('');
-  const [liveText, setLiveText] = useState('');
+  const [transcript, setTranscript] = useState('');       // final committed text
+  const [interimText, setInterimText] = useState('');     // Web Speech interim (instant)
+  const [whisperText, setWhisperText] = useState('');     // Whisper corrected current segment
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [volumeLevel, setVolumeLevel] = useState(0);
   const [loadProgress, setLoadProgress] = useState<LoadProgress>({ progress: 0, file: '' });
   const [error, setError] = useState<string | null>(null);
+  const [isWebSpeechActive, setIsWebSpeechActive] = useState(false);
 
   // Audio graph refs
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -90,112 +142,189 @@ export function useWhisper() {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
 
-  // Buffer & loop state
+  // Web Speech API ref
+  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+
+  // Buffer & state refs
   const audioBufferRef = useRef<Float32Array[]>([]);
   const isRecordingRef = useRef(false);
-  const loopRunningRef = useRef(false);
-  const liveTextRef = useRef('');
   const lastSoundRef = useRef(Date.now());
+  const whisperLoopRef = useRef(false);
 
-  // ── Commit liveText → transcript and reset the buffer ────────────────────
+  // Segment tracking: Web Speech accumulates finals per segment
+  const webSpeechSegmentRef = useRef('');   // Web Speech finals for current segment
+  const segmentStartTimeRef = useRef(0);
 
-  const commitLiveText = useCallback(() => {
-    const text = liveTextRef.current.trim();
-    if (text) {
-      setTranscript((prev) => (prev ? `${prev} ${text}` : text));
+  // ── Start Web Speech API (instant results) ──────────────────────────────
+
+  const startWebSpeech = useCallback(() => {
+    const SRCtor = getSpeechRecognitionCtor();
+    if (!SRCtor) return;
+
+    const recognition = new SRCtor();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
+    recognition.maxAlternatives = 1;
+
+    recognition.onresult = (event) => {
+      if (!isRecordingRef.current) return;
+
+      let interim = '';
+      let sessionFinal = '';
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) {
+          sessionFinal += result[0].transcript;
+        } else {
+          interim += result[0].transcript;
+        }
+      }
+
+      // Accumulate finals from Web Speech for current Whisper segment
+      if (sessionFinal) {
+        webSpeechSegmentRef.current += sessionFinal;
+      }
+
+      // Display: show interim text instantly
+      setInterimText(interim);
+    };
+
+    recognition.onerror = (ev) => {
+      // 'no-speech' and 'aborted' are not real errors
+      if (ev.error === 'no-speech' || ev.error === 'aborted') return;
+      console.warn('Web Speech error:', ev.error);
+    };
+
+    recognition.onend = () => {
+      // Auto-restart if still recording (Web Speech sometimes stops itself)
+      if (isRecordingRef.current) {
+        try {
+          recognition.start();
+        } catch {
+          // Already started or disposed
+        }
+      } else {
+        setIsWebSpeechActive(false);
+      }
+    };
+
+    recognitionRef.current = recognition;
+
+    try {
+      recognition.start();
+      setIsWebSpeechActive(true);
+    } catch {
+      console.warn('Web Speech API unavailable');
     }
-    liveTextRef.current = '';
-    setLiveText('');
-    audioBufferRef.current = [];
   }, []);
 
-  // ── Continuous transcription loop ────────────────────────────────────────
-  //
-  // Runs as a tight async loop while recording.  Each pass:
-  //   1. Combine entire pending buffer
-  //   2. If buffer is short → wait a bit and retry
-  //   3. If buffer exceeds MAX_WINDOW_S → commit & reset
-  //   4. Otherwise → transcribe the whole window, update liveText
-  //
-  // Because the window *grows* between passes, Whisper sees progressively
-  // more context and self-corrects earlier words (cross-packet correction).
+  const stopWebSpeech = useCallback(() => {
+    try {
+      recognitionRef.current?.stop();
+    } catch { /* ignore */ }
+    recognitionRef.current = null;
+    setIsWebSpeechActive(false);
+    setInterimText('');
+  }, []);
 
-  const runTranscriptionLoop = useCallback(async () => {
-    if (loopRunningRef.current) return;
-    loopRunningRef.current = true;
+  // ── Whisper background correction loop ───────────────────────────────────
+  //
+  //  Every WHISPER_SEGMENT_S seconds of audio, run Whisper on the buffered
+  //  audio.  If Whisper gives a result, commit it as the "true" text for
+  //  that segment (overriding the Web Speech text).  If Whisper has nothing,
+  //  fall back to Web Speech's accumulated finals.
+
+  const runWhisperLoop = useCallback(async () => {
+    if (whisperLoopRef.current) return;
+    whisperLoopRef.current = true;
 
     while (isRecordingRef.current) {
+      await sleep(200);
+
       const chunks = audioBufferRef.current;
-      if (chunks.length === 0) {
-        await sleep(100);
-        continue;
-      }
+      if (chunks.length === 0) continue;
 
       const combined = combineChunks(chunks);
-      const sampleRate = audioCtxRef.current?.sampleRate ?? 44_100;
-      const duration = combined.length / sampleRate;
+      const sr = audioCtxRef.current?.sampleRate ?? 44_100;
+      const duration = combined.length / sr;
 
-      // Not enough audio yet – wait a bit
-      if (duration < MIN_AUDIO_S) {
-        await sleep(100);
+      if (duration < WHISPER_SEGMENT_S) continue;
+
+      // ── Time to run Whisper on this segment ──
+      // Snapshot the buffer and the Web Speech text, then reset both
+      const audioSnapshot = combined;
+      const webSpeechFallback = webSpeechSegmentRef.current.trim();
+      audioBufferRef.current = [];
+      webSpeechSegmentRef.current = '';
+
+      if (audioSnapshot.length / sr < MIN_WHISPER_S) {
+        // Too short — just commit Web Speech text if any
+        if (webSpeechFallback) {
+          setTranscript(prev => prev ? `${prev} ${webSpeechFallback}` : webSpeechFallback);
+        }
+        setWhisperText('');
         continue;
       }
-
-      // Window too large → commit current text and start fresh
-      if (duration > MAX_WINDOW_S) {
-        commitLiveText();
-        continue;
-      }
-
-      // ── Transcribe the entire current window ──
-      const resampled = resampleTo16k(combined, sampleRate);
-      const normalised = normalise(resampled);
 
       setIsTranscribing(true);
       try {
-        const text = await transcribeAudio(normalised);
-        if (text && isRecordingRef.current) {
-          liveTextRef.current = text;
-          setLiveText(text);
+        const resampled = resampleTo16k(audioSnapshot, sr);
+        const normalised = normalise(resampled);
+        const whisperResult = await transcribeAudio(normalised);
+
+        // Use Whisper's result (more accurate), fall back to Web Speech
+        const finalText = whisperResult || webSpeechFallback;
+        if (finalText) {
+          setTranscript(prev => prev ? `${prev} ${finalText}` : finalText);
+          setWhisperText('');
         }
       } catch (err) {
-        console.error('Transcription error:', err);
+        console.error('Whisper error:', err);
+        // Fall back to Web Speech
+        if (webSpeechFallback) {
+          setTranscript(prev => prev ? `${prev} ${webSpeechFallback}` : webSpeechFallback);
+        }
       }
       setIsTranscribing(false);
-
-      // Small breather so we don't starve the main thread
-      await sleep(50);
     }
 
-    // ── Recording stopped – handle remaining audio ──────────────────────────
+    // ── Recording ended — flush remaining audio ─────────────────────────────
 
     const remaining = audioBufferRef.current;
+    const webSpeechRemaining = webSpeechSegmentRef.current.trim();
+    audioBufferRef.current = [];
+    webSpeechSegmentRef.current = '';
+
     if (remaining.length > 0) {
       const audio = combineChunks(remaining);
       const sr = audioCtxRef.current?.sampleRate ?? 44_100;
-      if (audio.length / sr >= MIN_AUDIO_S) {
+
+      if (audio.length / sr >= MIN_WHISPER_S) {
         setIsTranscribing(true);
         try {
-          const text = await transcribeAudio(
-            normalise(resampleTo16k(audio, sr)),
-          );
-          if (text) {
-            setTranscript((prev) => (prev ? `${prev} ${text}` : text));
+          const text = await transcribeAudio(normalise(resampleTo16k(audio, sr)));
+          const finalText = text || webSpeechRemaining;
+          if (finalText) {
+            setTranscript(prev => prev ? `${prev} ${finalText}` : finalText);
           }
-        } catch (err) {
-          console.error('Final transcription error:', err);
+        } catch {
+          if (webSpeechRemaining) {
+            setTranscript(prev => prev ? `${prev} ${webSpeechRemaining}` : webSpeechRemaining);
+          }
         }
         setIsTranscribing(false);
+      } else if (webSpeechRemaining) {
+        setTranscript(prev => prev ? `${prev} ${webSpeechRemaining}` : webSpeechRemaining);
       }
-      audioBufferRef.current = [];
-    } else if (liveTextRef.current) {
-      commitLiveText();
+    } else if (webSpeechRemaining) {
+      setTranscript(prev => prev ? `${prev} ${webSpeechRemaining}` : webSpeechRemaining);
     }
 
-    liveTextRef.current = '';
-    setLiveText('');
-    loopRunningRef.current = false;
-  }, [commitLiveText]);
+    setWhisperText('');
+    whisperLoopRef.current = false;
+  }, []);
 
   // ── Cleanup audio graph ──────────────────────────────────────────────────
 
@@ -216,11 +345,12 @@ export function useWhisper() {
     if (!isRecordingRef.current) return;
     isRecordingRef.current = false;
 
+    stopWebSpeech();
     cleanupAudio();
     setState('processing');
 
-    // Wait for the transcription loop to finish its final pass
-    while (loopRunningRef.current) {
+    // Wait for Whisper loop to finish flushing
+    while (whisperLoopRef.current) {
       await sleep(50);
     }
 
@@ -230,8 +360,9 @@ export function useWhisper() {
     audioCtxRef.current = null;
     analyserRef.current = null;
     setVolumeLevel(0);
+    setInterimText('');
     setState('ready');
-  }, [cleanupAudio]);
+  }, [cleanupAudio, stopWebSpeech]);
 
   const stopRef = useRef(stopRecording);
   stopRef.current = stopRecording;
@@ -265,8 +396,10 @@ export function useWhisper() {
   const startRecording = useCallback(async () => {
     try {
       setError(null);
-      setLiveText('');
-      liveTextRef.current = '';
+      setInterimText('');
+      setWhisperText('');
+      webSpeechSegmentRef.current = '';
+      segmentStartTimeRef.current = Date.now();
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -278,7 +411,6 @@ export function useWhisper() {
       });
       mediaStreamRef.current = stream;
 
-      // Use the browser's native sample rate – we resample to 16 kHz ourselves
       const ctx = new AudioContext();
       audioCtxRef.current = ctx;
 
@@ -299,7 +431,6 @@ export function useWhisper() {
       const silentGain = ctx.createGain();
       silentGain.gain.value = 0;
 
-      // source → gain → analyser → processor → silent → destination
       source.connect(gainNode);
       gainNode.connect(analyser);
       analyser.connect(processor);
@@ -316,7 +447,6 @@ export function useWhisper() {
         const data = e.inputBuffer.getChannelData(0);
         audioBufferRef.current.push(new Float32Array(data));
 
-        // Volume meter + silence detection
         let sum = 0;
         for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
         const rms = Math.sqrt(sum / data.length);
@@ -330,24 +460,33 @@ export function useWhisper() {
 
       setState('recording');
 
-      // Fire-and-forget: start the continuous transcription loop
-      runTranscriptionLoop();
+      // Start both engines simultaneously
+      startWebSpeech();
+      runWhisperLoop();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to access microphone');
     }
-  }, [runTranscriptionLoop]);
+  }, [startWebSpeech, runWhisperLoop]);
 
   const clearTranscript = useCallback(() => {
     setTranscript('');
-    setLiveText('');
-    liveTextRef.current = '';
+    setInterimText('');
+    setWhisperText('');
+    webSpeechSegmentRef.current = '';
   }, []);
+
+  // Compute the "live" text to show: Web Speech accumulated finals + interim
+  // This gives the user instant visual feedback
+  const liveText = (webSpeechSegmentRef.current + ' ' + interimText).trim();
 
   return {
     state,
     transcript,
+    interimText,
     liveText,
+    whisperText,
     isTranscribing,
+    isWebSpeechActive,
     volumeLevel,
     loadProgress,
     error,

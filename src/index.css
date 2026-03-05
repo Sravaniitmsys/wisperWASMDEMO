@@ -1,9 +1,10 @@
 /* ── Design tokens ────────────────────────────────────────────────────────── */
 :root {
-  --bg-primary: #0a0a1a;
-  --bg-card: #141428;
+  --bg-primary: #050510;
+  --bg-card: rgba(15, 15, 35, 0.7);
+  --bg-glass: rgba(255, 255, 255, 0.03);
   --accent: #00d4ff;
-  --accent-dim: rgba(0, 212, 255, 0.15);
+  --accent-dim: rgba(0, 212, 255, 0.1);
   --accent-purple: #7c3aed;
   --accent-green: #10b981;
   --accent-red: #ef4444;
@@ -11,9 +12,11 @@
   --text-primary: #f0f0f5;
   --text-secondary: #8888a0;
   --text-muted: #555570;
-  --border: rgba(255, 255, 255, 0.06);
-  --radius: 12px;
-  --radius-sm: 8px;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-glow: rgba(0, 212, 255, 0.15);
+  --radius: 16px;
+  --radius-sm: 10px;
+  --glass-blur: 20px;
 }
 
 /* ── Reset ────────────────────────────────────────────────────────────────── */
@@ -37,10 +40,26 @@ body {
   background: var(--bg-primary);
   color: var(--text-primary);
   min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* Animated gradient background */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 80% 60% at 50% 0%, rgba(0, 212, 255, 0.08) 0%, transparent 50%),
+    radial-gradient(ellipse 60% 50% at 80% 50%, rgba(124, 58, 237, 0.06) 0%, transparent 50%),
+    radial-gradient(ellipse 60% 50% at 20% 80%, rgba(16, 185, 129, 0.04) 0%, transparent 50%);
+  pointer-events: none;
+  z-index: 0;
 }
 
 #root {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+  position: relative;
+  z-index: 1;
 }

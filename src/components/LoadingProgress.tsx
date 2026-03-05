@@ -9,9 +9,9 @@ export default function LoadingProgress({ progress, file }: LoadingProgressProps
   return (
     <div className="loading-progress">
       <div className="loading-spinner" />
-      <p className="loading-text">Preparing Voice AI&hellip;</p>
+      <p className="loading-text">Loading Whisper Base&hellip;</p>
       <p className="loading-hint">
-        First load downloads ~44 MB (cached for future&nbsp;use)
+        First load downloads ~77 MB (cached for future&nbsp;use)
       </p>
 
       <div className="progress-bar-container">
